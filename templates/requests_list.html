@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Список заявок</title>
+    <script src="https://unpkg.com/htmx.org"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+</head>
+<body class="p-4">
+<h1 class="text-2xl font-bold mb-4">Список заявок</h1>
+<form class="mb-4 flex flex-wrap gap-2" hx-get="/webapp" hx-target="#requests-table" hx-swap="innerHTML">
+    <input type="text" name="query_id" placeholder="ID заявки" class="border px-2 py-1">
+    <input type="text" name="user_id" placeholder="ID пользователя" class="border px-2 py-1">
+    <input type="date" name="date" class="border px-2 py-1">
+    <button type="submit" class="bg-blue-600 text-white px-3 py-1">Поиск</button>
+</form>
+<table id="requests-table" class="table-auto w-full text-sm">
+    <thead class="bg-gray-100"><tr>
+      <th class="px-2 py-1">ID заявки</th>
+      <th class="px-2 py-1">Пользователь</th>
+      <th class="px-2 py-1">Создана</th>
+      <th class="px-2 py-1">Статус</th>
+    </tr></thead>
+    <tbody>
+    {% for req in requests %}
+    <tr class="border-b">
+      <td class="px-2 py-1"><a href="/webapp/requests/{{ req.id }}" class="text-blue-600 underline">{{ req.id }}</a></td>
+      <td class="px-2 py-1">{{ req.user_id }}</td>
+      <td class="px-2 py-1">{{ req.created_at }}</td>
+      <td class="px-2 py-1">{{ 'Открыта' if req.status == 'open' else 'Закрыта' }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+</table>
+<div class="mt-2">
+    {% if page > 1 %}
+    <a href="/webapp?page={{ page-1 }}" class="px-3 py-1 border">← Назад</a>
+    {% endif %}
+    {% if has_next %}
+    <a href="/webapp?page={{ page+1 }}" class="px-3 py-1 border">Вперёд →</a>
+    {% endif %}
+</div>
+</body>
+</html>
