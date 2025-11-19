@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Заявка {{ request.id }}</title>
+    <script src="https://unpkg.com/htmx.org"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+</head>
+<body class="p-4">
+<h1 class="text-xl font-bold mb-2">Заявка {{ request.id }}</h1>
+<p>ID пользователя: {{ request.user_id }}</p>
+<p>Дата: {{ request.created_at }}</p>
+<p>Статус: {{ 'Открыта' if request.status == 'open' else 'Закрыта' }}</p>
+<h2 class="text-lg font-bold mt-4">Диалог</h2>
+<div class="messages space-y-2 mb-4">
+{% for msg in messages %}
+    {% if msg.sender == 'user' %}
+        <div class="p-2 bg-gray-100 rounded-md">
+          <b>Пользователь:</b> {{ msg.text }} <small class="text-gray-500">{{ msg.time }}</small>
+        </div>
+    {% else %}
+        <div class="p-2 bg-blue-50 rounded-md text-right">
+          <b>Администратор:</b> {{ msg.text }} <small class="text-gray-500">{{ msg.time }}</small>
+        </div>
+    {% endif %}
+{% endfor %}
+</div>
+{% if request.status != 'closed' %}
+<form hx-post="/webapp/requests/{{ request.id }}/reply" hx-target=".messages" hx-swap="innerHTML">
+    <textarea name="reply_text" rows="3" class="w-full border px-2 py-1" placeholder="Введите ответ..."></textarea>
+    <button type="submit" class="mt-1 bg-green-600 text-white px-3 py-1">Ответить</button>
+</form>
+<form hx-post="/webapp/requests/{{ request.id }}/close" hx-swap="outerHTML">
+    <button type="submit" class="mt-2 bg-red-600 text-white px-3 py-1">Закрыть заявку</button>
+</form>
+{% else %}
+<p>Заявка закрыта.</p>
+{% endif %}
+</body>
+</html>
