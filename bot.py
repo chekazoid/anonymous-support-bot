@@ -1,48 +1,19 @@
-""" 
+"""
 Основной модуль телеграм‑бота для безопасного взаимодействия заявителей с
 правозащитниками. Скрипт написан с использованием библиотеки aiogram и
-проектирован в соответствии с техническим заданием, полученным от
-пользователя. В нём реализованы следующие ключевые возможности:
+проектирован в соответствии с техническим заданием. Реализованы:
 
-• Анонимизация: бот выступает посредником между заявителями и
-  администраторами правозащитной организации. Пользователь получает
-  ответы без раскрытия личности администратора, а администратор видит
-  только зашифрованные идентификаторы заявителей.
+• Анонимизация: бот выступает посредником между заявителями и администраторами.
+• Уникальные заявки: при создании заявки генерируется уникальный ID.
+• База данных: используется SQLite (через aiosqlite) с шифрованием данных (Fernet).
+• Работа с файлами: изображения очищаются от EXIF; документы пересылаются как есть.
+• Двухфакторная аутентификация для администраторов (упрощённо).
+• Ролевая модель доступа и ограничение частоты сообщений.
+• Верификация новых пользователей.
+• Проверка URL и файлов через VirusTotal с использованием хэшей (асинхронно).
+• Команды для администраторов: /close, /requests, /stats, /status, а также кнопка “Назад”.
 
-• Уникальные заявки: при создании заявки генерируется уникальный ID,
-  который используется для хранения диалога и поиска статуса.
-
-• База данных: используется SQLite (через aiosqlite) для хранения заявок,
-  сообщений и файлов. Все данные шифруются перед записью с помощью
-  симметричного шифрования (Fernet). Ключ шифрования задаётся через
-  переменную окружения ENCRYPTION_KEY.
-
-• Работа с файлами: бот принимает документы и изображения, удаляет из
-  изображений EXIF‑метаданные с помощью Pillow/piexif и пересылает
-  очищенные копии администраторам. Для других типов файлов предусмотрена
-  возможность доработки (например, переупаковка архивов).
-
-• Двухфакторная аутентификация для администраторов: чтобы использовать
-  административные команды, администратор должен ввести пароль, затем
-  одноразовый код. Для упрощения примера проверка OTP заменена на
-  фиксированное значение.
-
-• Ролевая модель: в конфигурации задаётся список пользователей с
-  различными ролями (owner, admin, moderator, volunteer). Роль влияет
-  на доступ к функциям и командам.
-
-• Ограничение частоты запросов и защита от спама: реализована простая
-  система rate limiting, не позволяющая пользователю отправлять больше
-  определённого числа сообщений за час.
-
-• Верификация новых пользователей: перед первой заявкой пользователю
-  предлагается ответить на вопрос из заранее подготовленного списка.
-
-Данный код предоставляет основу для построения защищённого
-телеграм‑бота. По сравнению с полным техническим заданием некоторые
-функции упрощены (например, использование Tor/VPN и реализация сложного 
-алгоритма защиты от timing‑атак). Они
-оставлены в виде мест для дальнейшего развития.
+Функции, связанные с Tor/VPN и глубоким мониторингом, оставлены как точки расширения.
 """
 
 import asyncio
@@ -67,15 +38,16 @@ import re
 import requests
 
 # ---------------------------------------------------------------------------
-# Конфигурация бота и глобальные переменные
+# Конфигурация и загрузка переменных окружения
 # ---------------------------------------------------------------------------
 from dotenv import load_dotenv
 load_dotenv()
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Переменная окружения BOT_TOKEN не установлена")
 
-ADMIN_GROUP_ID: int = int(os.getenv("ADMIN_GROUP_ID", "0"))
+ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID", "0"))
 if not ADMIN_GROUP_ID:
     raise RuntimeError("Переменная окружения ADMIN_GROUP_ID не установлена")
 
@@ -85,20 +57,22 @@ if not ENCRYPTION_KEY:
 fernet = Fernet(ENCRYPTION_KEY.encode())
 
 DB_PATH = os.getenv("DB_PATH", "data/database.db")
-
 VT_API_KEY: Optional[str] = os.getenv("VT_API_KEY")
 
+# Ограничение частоты сообщений
 RATE_LIMIT_COUNT = 100
 RATE_LIMIT_INTERVAL = timedelta(hours=1)
+user_message_timestamps: Dict[int, List[float]] = {}
 
+# Вопросы для верификации
 VERIFICATION_QUESTIONS = [
     "В каком городе вы находитесь?",
     "Какое слово указано в правилах канала?",
     "Сколько букв в слове 'свобода'?",
 ]
 
+# Список ролей; можно задать через ADMIN_IDS в .env (через запятую)
 ROLES: Dict[int, str] = {}
-# Загрузка списка администраторов из переменной окружения (если задано)
 admin_ids_env = os.getenv("ADMIN_IDS")
 if admin_ids_env:
     for uid_str in admin_ids_env.split(","):
@@ -106,10 +80,8 @@ if admin_ids_env:
         if uid_str.isdigit():
             ROLES[int(uid_str)] = "admin"
 
-user_message_timestamps: Dict[int, List[float]] = {}
-
 # ---------------------------------------------------------------------------
-# Классы состояний для FSM (машины состояний) aiogram
+# FSM состояния aiogram
 # ---------------------------------------------------------------------------
 class VerificationState(StatesGroup):
     awaiting_answer = State()
@@ -118,9 +90,10 @@ class NewRequestState(StatesGroup):
     awaiting_message = State()
 
 # ---------------------------------------------------------------------------
-# Вспомогательные функции (шифрование, база данных, проверки ролей)
+# Вспомогательные функции (БД, шифрование, роли, rate-limit)
 # ---------------------------------------------------------------------------
 async def init_db() -> None:
+    # Создание директорий и таблиц при первом запуске
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(
@@ -167,12 +140,93 @@ def generate_request_id() -> str:
 def is_admin(user_id: int) -> bool:
     return ROLES.get(user_id) in {"owner", "admin", "moderator", "volunteer"}
 
-def has_role(user_id: int, role: str) -> bool:
-    role_order = {"volunteer": 1, "moderator": 2, "admin": 3, "owner": 4}
-    user_role = ROLES.get(user_id)
-    if not user_role:
+def check_rate_limit(user_id: int) -> bool:
+    now = time.time()
+    timestamps = user_message_timestamps.setdefault(user_id, [])
+    cutoff = now - RATE_LIMIT_INTERVAL.total_seconds()
+    user_message_timestamps[user_id] = [t for t in timestamps if t > cutoff]
+    if len(user_message_timestamps[user_id]) >= RATE_LIMIT_COUNT:
         return False
-    return role_order.get(user_role, 0) >= role_order.get(role, 0)
+    user_message_timestamps[user_id].append(now)
+    return True
+
+def remove_exif_from_image_bytes(image_bytes: bytes) -> Optional[bytes]:
+    # Синхронная функция для удаления EXIF из изображения; будет вызвана в отдельном потоке
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        image_no_exif = Image.new(img.mode, img.size)
+        image_no_exif.putdata(list(img.getdata()))
+        output = io.BytesIO()
+        image_no_exif.save(output, format="PNG")
+        output.seek(0)
+        return output.read()
+    except Exception as ex:
+        logging.exception("Не удалось очистить изображение: %s", ex)
+        return None
+
+async def sanitize_image(bot: Bot, file_id: str) -> str:
+    """
+    Скачивает изображение, удаляет EXIF, отправляет очищенную версию в админ‑группу.
+    Возвращает file_id очищенного изображения (или оригинальный file_id при ошибке).
+    """
+    try:
+        f_info = await bot.get_file(file_id)
+        f_stream = await bot.download_file(f_info.file_path)
+        data = await f_stream.read()
+    except Exception as ex:
+        logging.exception("Ошибка загрузки изображения: %s", ex)
+        return file_id
+    sanitized_bytes = await asyncio.to_thread(remove_exif_from_image_bytes, data)
+    if sanitized_bytes:
+        msg = await bot.send_document(
+            ADMIN_GROUP_ID,
+            types.InputFile(io.BytesIO(sanitized_bytes), filename="sanitized.png")
+        )
+        return msg.document.file_id
+    else:
+        await bot.send_photo(ADMIN_GROUP_ID, file_id)
+        return file_id
+
+def extract_urls(text: str) -> List[str]:
+    if not text:
+        return []
+    return re.findall(r"https?://[^\s]+", text)
+
+def sync_vt_scan_file(file_bytes: bytes, filename: str) -> Optional[dict]:
+    # Проверка файла через VirusTotal по хэшу (синхронно)
+    if not VT_API_KEY:
+        return None
+    try:
+        import hashlib
+        file_hash = hashlib.sha256(file_bytes).hexdigest()
+        url = "https://www.virustotal.com/vtapi/v2/file/report"
+        resp = requests.get(url, params={"apikey": VT_API_KEY, "resource": file_hash}, timeout=30)
+        report = resp.json()
+        if report.get("response_code") == 1:
+            return report
+        return None
+    except Exception:
+        return None
+
+def sync_vt_scan_url(link: str) -> Optional[dict]:
+    # Проверка URL через VirusTotal (синхронно)
+    if not VT_API_KEY:
+        return None
+    try:
+        url = "https://www.virustotal.com/vtapi/v2/url/report"
+        resp = requests.get(url, params={"apikey": VT_API_KEY, "resource": link}, timeout=15)
+        report = resp.json()
+        if report.get("response_code") == 1:
+            return report
+        return None
+    except Exception:
+        return None
+
+async def vt_scan_file_bytes(file_bytes: bytes, filename: str) -> Optional[dict]:
+    return await asyncio.to_thread(sync_vt_scan_file, file_bytes, filename)
+
+async def vt_scan_url(link: str) -> Optional[dict]:
+    return await asyncio.to_thread(sync_vt_scan_url, link)
 
 async def record_message(user_id: int, request_id: str, sender: str, content: str) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -194,109 +248,19 @@ async def record_file(message_id: int, file_id: str, sanitized_file_id: str) -> 
         )
         await db.commit()
 
-def check_rate_limit(user_id: int) -> bool:
-    now = time.time()
-    timestamps = user_message_timestamps.setdefault(user_id, [])
-    cutoff = now - RATE_LIMIT_INTERVAL.total_seconds()
-    user_message_timestamps[user_id] = [t for t in timestamps if t > cutoff]
-    if len(user_message_timestamps[user_id]) >= RATE_LIMIT_COUNT:
-        return False
-    user_message_timestamps[user_id].append(now)
-    return True
-
-# Функция для удаления EXIF-данных из изображения (для использования в потоке)
-def remove_exif_from_image_bytes(image_bytes: bytes) -> Optional[bytes]:
-    try:
-        img = Image.open(io.BytesIO(image_bytes))
-        image_no_exif = Image.new(img.mode, img.size)
-        image_no_exif.putdata(list(img.getdata()))
-        output = io.BytesIO()
-        image_no_exif.save(output, format="PNG")
-        output.seek(0)
-        return output.read()
-    except Exception as ex:
-        logging.exception("Не удалось очистить изображение: %s", ex)
-        return None
-
-async def sanitize_image(bot: Bot, file_id: str) -> str:
-    """
-    Скачивает изображение, удаляет EXIF-данные и отправляет очищенную версию.
-    Возвращает file_id очищенного изображения. Если очистить не удалось, возвращает исходный file_id.
-    """
-    try:
-        f_info = await bot.get_file(file_id)
-        f_stream = await bot.download_file(f_info.file_path)
-        data = await f_stream.read()
-    except Exception as ex:
-        logging.exception("Ошибка загрузки изображения: %s", ex)
-        return file_id
-    # Обработка изображения в отдельном потоке, чтобы не блокировать основную работу бота
-    sanitized_bytes = await asyncio.to_thread(remove_exif_from_image_bytes, data)
-    if sanitized_bytes:
-        # Отправляем очищенное изображение администратору
-        msg = await bot.send_document(
-            ADMIN_GROUP_ID,
-            types.InputFile(io.BytesIO(sanitized_bytes), filename="sanitized.png")
-        )
-        return msg.document.file_id
-    else:
-        # Если не удалось очистить, пересылаем оригинальное изображение
-        await bot.send_photo(ADMIN_GROUP_ID, file_id)
-        return file_id
-
-def extract_urls(text: str) -> List[str]:
-    if not text:
-        return []
-    return re.findall(r"https?://[^\s]+", text)
-
-def sync_vt_scan_file(file_bytes: bytes, filename: str) -> Optional[dict]:
-    if not VT_API_KEY:
-        return None
-    try:
-        # Проверка по хешу файла (sha256) без загрузки файла
-        import hashlib
-        file_hash = hashlib.sha256(file_bytes).hexdigest()
-        report_url = "https://www.virustotal.com/vtapi/v2/file/report"
-        resp = requests.get(report_url, params={"apikey": VT_API_KEY, "resource": file_hash}, timeout=30)
-        report = resp.json()
-        if report.get("response_code") == 1:
-            return report
-        return None
-    except Exception:
-        return None
-
-def sync_vt_scan_url(link: str) -> Optional[dict]:
-    if not VT_API_KEY:
-        return None
-    try:
-        report_url = "https://www.virustotal.com/vtapi/v2/url/report"
-        resp = requests.get(report_url, params={"apikey": VT_API_KEY, "resource": link}, timeout=15)
-        report = resp.json()
-        if report.get("response_code") == 1:
-            return report
-        return None
-    except Exception:
-        return None
-
-async def vt_scan_file_bytes(file_bytes: bytes, filename: str) -> Optional[dict]:
-    return await asyncio.to_thread(sync_vt_scan_file, file_bytes, filename)
-
-async def vt_scan_url(link: str) -> Optional[dict]:
-    return await asyncio.to_thread(sync_vt_scan_url, link)
-
 # ---------------------------------------------------------------------------
 # Обработчики команд и сообщений
 # ---------------------------------------------------------------------------
 async def start_handler(message: types.Message, state: FSMContext) -> None:
+    # Регистрация пользователя в БД, если ещё нет
     user_id = message.from_user.id
-    # Регистрация пользователя в БД, если необходимо
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT verified FROM users WHERE user_id = ?", (user_id,))
         row = await cursor.fetchone()
         if row is None:
             await db.execute("INSERT INTO users (user_id, verified) VALUES (?, 0)", (user_id,))
             await db.commit()
-    # Главное меню пользователя
+    # Главное меню
     keyboard = InlineKeyboardMarkup(row_width=2)
     keyboard.add(
         InlineKeyboardButton("Новая заявка", callback_data="new_request"),
@@ -325,7 +289,7 @@ async def callback_handler(query: types.CallbackQuery, state: FSMContext) -> Non
             await query.message.edit_text(f"Чтобы продолжить, ответьте на вопрос для верификации:\n{question}")
             await query.answer()
             return
-        # Переключение в режим ввода заявки
+        # Начинаем приём сообщений по новой заявке
         await query.message.edit_text(
             "Пожалуйста, опишите вашу проблему одним или несколькими сообщениями.\n"
             "Когда закончите, отправьте /end, чтобы закрыть заявку."
@@ -334,6 +298,7 @@ async def callback_handler(query: types.CallbackQuery, state: FSMContext) -> Non
         await state.update_data(request_id=request_id)
         await NewRequestState.awaiting_message.set()
     elif data == "my_requests":
+        # Список заявок пользователя
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
                 "SELECT id, created_at, status FROM requests WHERE user_id = ? ORDER BY created_at DESC",
@@ -346,7 +311,6 @@ async def callback_handler(query: types.CallbackQuery, state: FSMContext) -> Non
             text_lines = ["Ваши заявки:"]
             for rid, created, status in rows:
                 text_lines.append(f"ID: {rid} | Создано: {created} | Статус: {status}")
-            # Добавляем кнопку возврата к главному меню
             keyboard = InlineKeyboardMarkup().add(InlineKeyboardButton("Назад", callback_data="main_menu"))
             await query.message.edit_text("\n".join(text_lines), reply_markup=keyboard)
     elif data == "request_status":
@@ -372,6 +336,7 @@ async def callback_handler(query: types.CallbackQuery, state: FSMContext) -> Non
     await query.answer()
 
 async def verification_answer_handler(message: types.Message, state: FSMContext) -> None:
+    # Обработчик ответа на верификационный вопрос
     user_id = message.from_user.id
     data = await state.get_data()
     expected = data.get("verification_answer")
@@ -379,16 +344,16 @@ async def verification_answer_handler(message: types.Message, state: FSMContext)
         await message.answer("Неожиданный ответ. Попробуйте снова позже.")
         await state.finish()
         return
-    # Отметить пользователя как верифицированного
+    # Отмечаем пользователя как проверенного
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE users SET verified = 1 WHERE user_id = ?", (user_id,))
         await db.commit()
     await message.answer("Спасибо! Вы прошли верификацию и теперь можете создавать заявки.")
     await state.finish()
-    # После верификации показываем меню /start снова
     await start_handler(message, state)
 
 async def new_request_message_handler(message: types.Message, state: FSMContext) -> None:
+    # Приём сообщений в рамках новой заявки
     user_id = message.from_user.id
     if not check_rate_limit(user_id):
         await message.answer("Вы слишком часто отправляете сообщения. Попробуйте позже.")
@@ -399,12 +364,13 @@ async def new_request_message_handler(message: types.Message, state: FSMContext)
         await message.answer("Не найден ID заявки. Пожалуйста, начните заново.")
         await state.finish()
         return
+    # Завершение заявки
     if message.text and message.text.strip().lower() == "/end":
         await message.answer("Ваша заявка отправлена. Спасибо!")
         await state.finish()
         return
     content = message.text or message.caption or "[файл]"
-    # Проверка текста на ссылки (фишинг/вредоносные)
+    # Проверка ссылок через VirusTotal
     if content and content != "[файл]":
         urls = extract_urls(content)
         if urls and VT_API_KEY:
@@ -414,8 +380,7 @@ async def new_request_message_handler(message: types.Message, state: FSMContext)
                     await message.answer("В вашем сообщении обнаружена подозрительная ссылка. Сообщение отклонено.")
                     return
     flagged = False
-    sanitized_file_id: Optional[str] = None
-    # Проверяем документы
+    # Проверка документов
     if message.document:
         file_name = message.document.file_name or "document"
         try:
@@ -432,6 +397,7 @@ async def new_request_message_handler(message: types.Message, state: FSMContext)
             await message.answer("Прикреплённый файл определён как потенциально вредоносный и не будет отправлен.")
             return
     elif message.photo:
+        # Проверка изображений
         try:
             file_id_img = message.photo[-1].file_id
             f_info = await message.bot.get_file(file_id_img)
@@ -446,12 +412,12 @@ async def new_request_message_handler(message: types.Message, state: FSMContext)
         if flagged:
             await message.answer("Загруженное изображение определено как вредоносное и не будет отправлено.")
             return
-    # Сохраняем сообщение (текст) в базе данных
+    # Сохраняем текст сообщения в БД
     msg_id = await record_message(user_id, request_id, "user", content)
-    # Обработка файлов: пересылка админам
+    # Обработка файлов
     if message.document:
         file_id = message.document.file_id
-        sanitized_file_id = file_id  # для документов пока без обработки
+        sanitized_file_id = file_id
         await record_file(msg_id, file_id, sanitized_file_id)
         await message.bot.send_document(
             ADMIN_GROUP_ID,
@@ -462,13 +428,13 @@ async def new_request_message_handler(message: types.Message, state: FSMContext)
         file_id = message.photo[-1].file_id
         sanitized_file_id = await sanitize_image(message.bot, file_id)
         await record_file(msg_id, file_id, sanitized_file_id)
-    # Пересылаем текст заявки администраторам, если он есть
+    # Пересылаем текст заявки администраторам
     if content and content != "[файл]":
         await message.bot.send_message(
             ADMIN_GROUP_ID,
             f"Новая заявка {request_id} от пользователя {user_id}:\n{content}"
         )
-    # Сохраняем запись о заявке (если новая)
+    # Записываем заявку в requests (если новая)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT OR IGNORE INTO requests (id, user_id, created_at, status) VALUES (?, ?, ?, ?)",
@@ -476,13 +442,12 @@ async def new_request_message_handler(message: types.Message, state: FSMContext)
         )
         await db.commit()
 
-# Для получения сообщений в группе необходимо отключить Privacy Mode бота в BotFather.
+# Для получения сообщений в группе необходимо отключить Privacy Mode у бота через BotFather
 async def admin_reply_handler(message: types.Message) -> None:
-    # Обрабатывает ответ админа (в приватной группе) на сообщение от бота
+    # Ответ администратора в приватной группе
     if message.chat.id != ADMIN_GROUP_ID:
         return
     user_id = message.from_user.id
-    # Если заданы роли, требуем роль админа; если ролей нет, допускаем всех в группе
     if ROLES and not is_admin(user_id):
         return
     if not message.reply_to_message:
@@ -505,7 +470,7 @@ async def admin_reply_handler(message: types.Message) -> None:
         logging.exception("Не удалось отправить ответ пользователю: %s", ex)
 
 async def status_command_handler(message: types.Message) -> None:
-    """Обрабатывает команду /status <ID>."""
+    """Команда /status <ID> для просмотра статуса заявки."""
     parts = message.get_args().split()
     if not parts:
         await message.reply("Использование: /status <ID заявки>")
@@ -547,7 +512,7 @@ async def status_command_handler(message: types.Message) -> None:
     await message.reply("\n".join(lines))
 
 async def close_command_handler(message: types.Message) -> None:
-    # Команда /close <ID> - закрыть заявку
+    # Команда /close <ID> закрывает заявку
     if ROLES:
         if not is_admin(message.from_user.id):
             return
@@ -578,7 +543,7 @@ async def close_command_handler(message: types.Message) -> None:
         logging.exception("Не удалось уведомить пользователя о закрытии: %s", ex)
 
 async def list_requests_handler(message: types.Message) -> None:
-    # Команда /requests [status] - показать заявки по статусу (open, closed, all)
+    # Команда /requests [open|closed|all] выводит список заявок
     if ROLES:
         if not is_admin(message.from_user.id):
             return
@@ -601,7 +566,6 @@ async def list_requests_handler(message: types.Message) -> None:
         await message.reply(f"Нет заявок {status_text}.")
         return
     lines = [f"Заявки ({ 'все' if status_filter=='all' else status_filter }):"]
-    # Ограничиваем вывод до 20 заявок, если их слишком много
     for rid, uid, status in rows[:20]:
         lines.append(f"{rid} | Пользователь: {uid} | Статус: {status}")
     if len(rows) > 20:
@@ -609,7 +573,7 @@ async def list_requests_handler(message: types.Message) -> None:
     await message.reply("\n".join(lines))
 
 async def stats_command_handler(message: types.Message) -> None:
-    # Команда /stats - вывести статистику по заявкам
+    # Команда /stats выводит краткую статистику
     if ROLES:
         if not is_admin(message.from_user.id):
             return
@@ -626,9 +590,11 @@ async def stats_command_handler(message: types.Message) -> None:
     await message.reply(f"Всего заявок: {total}\nОткрытые: {open_count}\nЗакрытые: {closed_count}")
 
 async def unknown_message_handler(message: types.Message) -> None:
-    # Обработчик на случай неизвестной команды или сообщения
     await message.reply("Извините, я не понял команду. Используйте /start для начала работы.")
 
+# ---------------------------------------------------------------------------
+# Точка входа
+# ---------------------------------------------------------------------------
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     await init_db()
