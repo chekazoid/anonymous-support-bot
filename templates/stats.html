@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Статистика</title>
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+</head>
+<body class="p-4">
+<h1 class="text-xl font-bold mb-2">Статистика</h1>
+<ul class="list-disc ml-5 mb-4">
+<li>Открытых заявок: <b>{{ open_count }}</b></li>
+<li>Закрытых заявок: <b>{{ closed_count }}</b></li>
+<li>Среднее время ответа:
+  {% if avg_resp_time %}
+    <b>
+    {% set total_seconds = avg_resp_time.total_seconds() | int %}
+    {% set hours = total_seconds // 3600 %}
+    {% set minutes = (total_seconds % 3600) // 60 %}
+    {% set seconds = total_seconds % 60 %}
+    {{ hours }} ч {{ minutes }} мин {{ seconds }} сек
+    </b>
+  {% else %}
+    <i>нет данных</i>
+  {% endif %}
+</li>
+</ul>
+
+<h2 class="text-lg font-bold mb-2">Активность по дням</h2>
+<table class="table-auto text-sm">
+<thead><tr><th class="px-2 py-1">Дата</th><th class="px-2 py-1">Заявок</th></tr></thead>
+<tbody>
+{% for date, count in activity %}
+<tr><td class="border px-2 py-1">{{ date }}</td><td class="border px-2 py-1">{{ count }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</body>
+</html>
